@@ -1,0 +1,423 @@
+# -*- coding: utf-8 -*-
+"""
+EurorackPanels.FCMacro
+----------------------
+Builds parametric Eurorack (3U) front panels driven by spreadsheets.
+
+  Sheet "Params"        -> global values (height, thickness, clearance, ...)
+  Sheet "Place_<NAME>"  -> one per panel: HP (cell J1) + the placement list
+
+Placement list columns (row 2 downwards, stops at first empty "type"):
+  A ID | B type | C x | D y | E dia | F length | G label
+  - x, y  : centre of the feature, mm from the panel's bottom-left corner
+  - type  : jack, pot, led, switch, hole, slot
+  - dia   : leave empty to use the lookup table below
+  - length: only for slots (horizontal, overall length incl. rounded ends)
+
+Edit a cell -> recompute (Ctrl+R) -> the panel updates.
+Re-running the macro never overwrites sheets you already edited.
+
+Tested target: FreeCAD 0.21 / 1.0. Keep this macro file in your FreeCAD
+Macro folder so panels reload correctly in other sessions.
+"""
+
+import os
+import FreeCAD as App
+import Part
+from FreeCAD import Vector
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+DEFAULTS = [
+    # alias, value, description
+    ("PanelHeight", 128.5, "Eurorack 3U panel height (mm)"),
+    ("Thickness", 2.0, "Panel thickness (mm)"),
+    ("HPPitch", 5.08, "1 HP (mm)"),
+    ("Clearance", 0.3, "Total width clearance so neighbours do not jam (mm)"),
+    ("MountDia", 3.2, "Mounting hole diameter (mm)"),
+    ("MountInsetX", 7.5, "First mounting hole from left edge (mm)"),
+    ("MountInsetY", 3.0, "Mounting hole from top/bottom edge (mm)"),
+    ("MountSlot", 0, "1 = slots instead of round mounting holes"),
+    ("MountSlotLen", 5.08, "Mounting slot overall length (mm)"),
+    ("TwoSidedFromHP", 10, "Panels this wide or wider get holes on both sides"),
+    ("MinEdgeGap", 2.0, "Minimum material between two cutouts (mm)"),
+    ("EdgeMargin", 1.5, "Minimum material between a cutout and the panel edge (mm)"),
+]
+
+# Hole diameters (mm) used when the dia cell is empty. One place to tune.
+LOOKUP = {
+    "jack": 6.0,    # 3.5 mm jack
+    "pot": 7.2,     # 9 mm pot
+    "led": 3.1,     # 3 mm LED
+    "switch": 6.2,  # mini toggle - check your part
+    "hole": None,   # needs dia
+    "slot": None,   # needs dia (+ length)
+}
+
+# Demo panels so the macro runs out of the box.
+# rows: (ID, type, x, y, dia, length, label)
+PANELS = {
+    "VCO": {"HP": 10, "rows": [
+        ("P1", "pot", 25.25, 100, None, None, "FREQ"),
+        ("P2", "pot", 25.25, 80, None, None, "FINE"),
+        ("S1", "switch", 25.25, 60, None, None, "RANGE"),
+        ("J1", "jack", 12.0, 38, None, None, "V/OCT"),
+        ("J2", "jack", 38.5, 38, None, None, "OUT"),
+        ("J3", "jack", 12.0, 22, None, None, "SYNC"),
+        ("L1", "led", 38.5, 22, None, None, "ON"),
+    ]},
+    "VCA": {"HP": 6, "rows": [
+        ("P1", "pot", 15.09, 100, None, None, "LEVEL"),
+        ("J1", "jack", 15.09, 70, None, None, "IN"),
+        ("J2", "jack", 15.09, 50, None, None, "CV"),
+        ("J3", "jack", 15.09, 30, None, None, "OUT"),
+    ]},
+    "LFO": {"HP": 8, "rows": [
+        ("P1", "pot", 20.17, 100, None, None, "RATE"),
+        ("S1", "switch", 20.17, 82, None, None, "SHAPE"),
+        ("L1", "led", 20.17, 68, None, None, "RATE"),
+        ("J1", "jack", 12.0, 40, None, None, "OUT"),
+        ("J2", "jack", 28.3, 40, None, None, "CV"),
+    ]},
+    "MIX": {"HP": 4, "rows": [
+        ("J1", "jack", 10.01, 100, None, None, "IN1"),
+        ("J2", "jack", 10.01, 85, None, None, "IN2"),
+        ("J3", "jack", 10.01, 70, None, None, "IN3"),
+        ("P1", "pot", 10.01, 50, None, None, "MASTER"),
+        ("J4", "jack", 10.01, 25, None, None, "OUT"),
+    ]},
+}
+
+# Optional: path to a single-line / sans TTF font to create engraving labels.
+# Leave "" to skip label creation.
+FONT_FILE = ""
+LABEL_SIZE = 2.0  # mm text height
+GAP_BETWEEN_PANELS = 10.0  # only for viewing in the 3D view
+
+OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "eurorack_output")
+
+
+# ----------------------------------------------------------------------
+# Spreadsheet helpers
+# ----------------------------------------------------------------------
+def ensure_sheet(doc, name):
+    sheet = doc.getObject(name)
+    created = False
+    if sheet is None:
+        sheet = doc.addObject("Spreadsheet::Sheet", name)
+        created = True
+    return sheet, created
+
+
+def cell(sheet, addr, default=None):
+    """Read a cell or alias; empty cells return default."""
+    try:
+        v = sheet.get(addr)
+    except Exception:
+        return default
+    if hasattr(v, "Value"):
+        v = v.Value
+    return v
+
+
+def as_float(v, default=None):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_params_sheet(doc):
+    sheet, created = ensure_sheet(doc, "Params")
+    if created:
+        sheet.set("A1", "Parameter")
+        sheet.set("B1", "Value")
+        sheet.set("C1", "Note")
+        for i, (alias, value, note) in enumerate(DEFAULTS, start=2):
+            sheet.set("A%d" % i, alias)
+            sheet.set("B%d" % i, str(value))
+            sheet.setAlias("B%d" % i, alias)
+            sheet.set("C%d" % i, note)
+        doc.recompute()
+    return sheet
+
+
+def build_place_sheet(doc, name, spec):
+    sheet, created = ensure_sheet(doc, "Place_" + name)
+    if created:
+        for col, head in zip("ABCDEFG", ["ID", "type", "x", "y", "dia", "length", "label"]):
+            sheet.set(col + "1", head)
+        sheet.set("I1", "HP")
+        sheet.set("J1", str(spec["HP"]))
+        sheet.setAlias("J1", "HP")
+        for r, row in enumerate(spec["rows"], start=2):
+            for col, val in zip("ABCDEFG", row):
+                if val is None:
+                    continue
+                if col in "CDEF":
+                    sheet.set("%s%d" % (col, r), str(val))
+                else:
+                    sheet.set("%s%d" % (col, r), "'" + str(val))
+        doc.recompute()
+    return sheet
+
+
+def read_params(sheet):
+    P = {}
+    for alias, default, _ in DEFAULTS:
+        P[alias] = as_float(cell(sheet, alias), default)
+    return P
+
+
+def read_features(place, P):
+    """Return (features, warnings). feature = dict(id,type,x,y,dia,length,label)."""
+    feats, warns = [], []
+    for r in range(2, 202):
+        ftype = cell(place, "B%d" % r)
+        if ftype in (None, ""):
+            break
+        ftype = str(ftype).strip().lower()
+        fid = cell(place, "A%d" % r, "row%d" % r)
+        x = as_float(cell(place, "C%d" % r))
+        y = as_float(cell(place, "D%d" % r))
+        dia = as_float(cell(place, "E%d" % r))
+        length = as_float(cell(place, "F%d" % r))
+        label = cell(place, "G%d" % r, "")
+        if ftype not in LOOKUP:
+            warns.append("%s: unknown type '%s' (skipped)" % (fid, ftype))
+            continue
+        if dia is None:
+            dia = LOOKUP[ftype]
+        if x is None or y is None or dia is None:
+            warns.append("%s: missing x, y or diameter (skipped)" % fid)
+            continue
+        if ftype == "slot" and (length is None or length <= dia):
+            warns.append("%s: slot needs length > dia (skipped)" % fid)
+            continue
+        feats.append(dict(id=str(fid), type=ftype, x=x, y=y, dia=dia,
+                          length=length if ftype == "slot" else None,
+                          label=str(label) if label is not None else ""))
+    return feats, warns
+
+
+# ----------------------------------------------------------------------
+# Geometry
+# ----------------------------------------------------------------------
+def make_cutter(x, y, dia, length, thickness):
+    r = dia / 2.0
+    h = thickness + 2.0
+    z = -1.0
+    if length and length > dia:
+        half = (length - dia) / 2.0
+        c1 = Part.makeCylinder(r, h, Vector(x - half, y, z))
+        c2 = Part.makeCylinder(r, h, Vector(x + half, y, z))
+        box = Part.makeBox(length - dia, dia, h, Vector(x - half, y - r, z))
+        return c1.fuse(box).fuse(c2)
+    return Part.makeCylinder(r, h, Vector(x, y, z))
+
+
+def mounting_features(P, hp, width):
+    feats = []
+    xs = [P["MountInsetX"]]
+    if hp >= P["TwoSidedFromHP"]:
+        xs.append(P["MountInsetX"] + (hp - 3) * P["HPPitch"])
+    ys = [P["MountInsetY"], P["PanelHeight"] - P["MountInsetY"]]
+    slot = P["MountSlot"] >= 1
+    for i, x in enumerate(xs):
+        for j, y in enumerate(ys):
+            feats.append(dict(id="M%d%d" % (i + 1, j + 1), type="mount", x=x, y=y,
+                              dia=P["MountDia"],
+                              length=P["MountSlotLen"] if slot else None, label=""))
+    return feats
+
+
+def extent(f):
+    """Half-size in x and y of a feature."""
+    hx = (f["length"] or f["dia"]) / 2.0
+    hy = f["dia"] / 2.0
+    return hx, hy
+
+
+def validate(feats, P, width, height):
+    warns = []
+    for f in feats:
+        hx, hy = extent(f)
+        m = P["EdgeMargin"]
+        if f["x"] - hx < m or f["x"] + hx > width - m or f["y"] - hy < m or f["y"] + hy > height - m:
+            warns.append("%s: too close to / outside the panel edge" % f["id"])
+    for i in range(len(feats)):
+        for j in range(i + 1, len(feats)):
+            a, b = feats[i], feats[j]
+            # conservative: treat slots as circles of their longest half-size
+            ra = max(extent(a))
+            rb = max(extent(b))
+            d = ((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2) ** 0.5
+            if d - ra - rb < P["MinEdgeGap"]:
+                warns.append("%s and %s: only %.2f mm between cutouts (min %.1f)"
+                             % (a["id"], b["id"], d - ra - rb, P["MinEdgeGap"]))
+    return warns
+
+
+def build_shape(params, place):
+    P = read_params(params)
+    hp = as_float(cell(place, "HP"), 8.0)
+    width = hp * P["HPPitch"] - P["Clearance"]
+    height = P["PanelHeight"]
+    T = P["Thickness"]
+
+    user_feats, warns = read_features(place, P)
+    mount = mounting_features(P, hp, width)
+    allf = mount + user_feats
+    warns += validate(allf, P, width, height)
+
+    body = Part.makeBox(width, height, T)
+    for f in allf:
+        body = body.cut(make_cutter(f["x"], f["y"], f["dia"], f["length"], T))
+    body = body.removeSplitter()
+    return body, allf, warns, width
+
+
+# ----------------------------------------------------------------------
+# Parametric object
+# ----------------------------------------------------------------------
+class PanelProxy:
+    def __init__(self, obj):
+        obj.Proxy = self
+        if "ParamSheet" not in obj.PropertiesList:
+            obj.addProperty("App::PropertyLink", "ParamSheet", "Panel", "Global parameter sheet")
+            obj.addProperty("App::PropertyLink", "PlaceSheet", "Panel", "Placement list sheet")
+
+    def execute(self, obj):
+        if obj.ParamSheet is None or obj.PlaceSheet is None:
+            return
+        shape, feats, warns, width = build_shape(obj.ParamSheet, obj.PlaceSheet)
+        shape.Placement = obj.Placement  # keep the 3D layout offset
+        obj.Shape = shape
+        for w in warns:
+            App.Console.PrintWarning("[%s] %s\n" % (obj.Label, w))
+
+    def onChanged(self, obj, prop):
+        pass
+
+    def __getstate__(self):
+        return None
+
+    def __setstate__(self, state):
+        return None
+
+
+def get_or_make_panel(doc, name, params, place):
+    obj = doc.getObject("Panel_" + name)
+    if obj is None:
+        obj = doc.addObject("Part::FeaturePython", "Panel_" + name)
+    PanelProxy(obj)
+    obj.ParamSheet = params
+    obj.PlaceSheet = place
+    try:
+        obj.ViewObject.Proxy = 0
+    except Exception:
+        pass
+    return obj
+
+
+# ----------------------------------------------------------------------
+# Optional: engraving labels (ShapeString)
+# ----------------------------------------------------------------------
+def make_labels(doc, obj, feats):
+    if not FONT_FILE or not os.path.exists(FONT_FILE):
+        return
+    try:
+        import Draft
+        make_ss = getattr(Draft, "make_shapestring", None) or getattr(Draft, "makeShapeString")
+    except Exception as e:
+        App.Console.PrintWarning("Labels skipped: %s\n" % e)
+        return
+    T = obj.ParamSheet and read_params(obj.ParamSheet)["Thickness"]
+    for f in feats:
+        if not f["label"]:
+            continue
+        name = "Label_%s_%s" % (obj.Label, f["id"])
+        if doc.getObject(name):
+            continue
+        ss = make_ss(String=f["label"], FontFile=FONT_FILE, Size=LABEL_SIZE, Tracking=0)
+        ss.Label = name
+        # place the text just below the feature
+        ss.Placement.Base = obj.Placement.Base + Vector(
+            f["x"] - len(f["label"]) * LABEL_SIZE * 0.3,
+            f["y"] - f["dia"] / 2.0 - LABEL_SIZE - 1.5, T)
+
+
+# ----------------------------------------------------------------------
+# Export 2D outline + holes to DXF (flat, at Z=0, local coordinates)
+# ----------------------------------------------------------------------
+def export_dxf(doc, obj, outdir):
+    try:
+        import importDXF
+    except Exception as e:
+        App.Console.PrintWarning("DXF export unavailable: %s\n" % e)
+        return None
+    os.makedirs(outdir, exist_ok=True)
+    shp = obj.Shape.copy()
+    shp.Placement = App.Placement()
+    T = read_params(obj.ParamSheet)["Thickness"]
+    tops = [f for f in shp.Faces
+            if abs(f.CenterOfMass.z - T) < 1e-6 and abs(f.normalAt(0, 0).z - 1) < 1e-6]
+    if not tops:
+        App.Console.PrintWarning("No top face found for %s\n" % obj.Label)
+        return None
+    flat = Part.makeCompound(tops[0].Wires)
+    flat.translate(Vector(0, 0, -T))
+    tmp = doc.addObject("Part::Feature", "TMP_DXF")
+    tmp.Shape = flat
+    path = os.path.join(outdir, "%s.dxf" % obj.Label.replace("Panel_", ""))
+    try:
+        importDXF.export([tmp], path)
+    finally:
+        doc.removeObject(tmp.Name)
+    App.Console.PrintMessage("DXF written: %s\n" % path)
+    return path
+
+
+def export_all_dxf(doc=None, outdir=OUTPUT_DIR):
+    doc = doc or App.ActiveDocument
+    for o in doc.Objects:
+        if o.Name.startswith("Panel_"):
+            export_dxf(doc, o, outdir)
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    doc = App.ActiveDocument or App.newDocument("EurorackPanels")
+    params = build_params_sheet(doc)
+
+    x_off = 0.0
+    for name, spec in PANELS.items():
+        place = build_place_sheet(doc, name, spec)
+        obj = get_or_make_panel(doc, name, params, place)
+        hp = as_float(cell(place, "HP"), spec["HP"])
+        width = hp * read_params(params)["HPPitch"] - read_params(params)["Clearance"]
+        obj.Placement = App.Placement(Vector(x_off, 0, 0), App.Rotation())
+        x_off += width + GAP_BETWEEN_PANELS
+
+    doc.recompute()
+
+    for o in doc.Objects:
+        if o.Name.startswith("Panel_"):
+            _, feats, _, _ = build_shape(o.ParamSheet, o.PlaceSheet)
+            make_labels(doc, o, [f for f in feats if f["type"] != "mount"])
+
+    doc.recompute()
+    try:
+        import FreeCADGui
+        FreeCADGui.SendMsgToActiveView("ViewFit")
+    except Exception:
+        pass
+    App.Console.PrintMessage("Eurorack panels built. Call export_all_dxf() to write DXFs.\n")
+
+
+main()
+# To write DXFs afterwards, uncomment:
+# export_all_dxf()
